@@ -13,9 +13,13 @@ import * as challengeUtils from '../lib/challengeUtils'
 
 export function servePublicFiles () {
   return ({ params, query }: Request, res: Response, next: NextFunction) => {
-    const file = params.file
+    let file = params.file
 
-    if (!file.includes('/')) {
+    if (file) {
+      file = security.cutOffPoisonNullByte(file)
+    }
+
+    if (file && !file.includes('/') && !file.includes('\\')) {
       verify(file, res, next)
     } else {
       res.status(403)
@@ -25,8 +29,6 @@ export function servePublicFiles () {
 
   function verify (file: string, res: Response, next: NextFunction) {
     if (file && (endsWithAllowlistedFileType(file) || (file === 'incident-support.kdbx'))) {
-      file = security.cutOffPoisonNullByte(file)
-
       challengeUtils.solveIf(challenges.directoryListingChallenge, () => { return file.toLowerCase() === 'acquisitions.md' })
       verifySuccessfulPoisonNullByteExploit(file)
 
