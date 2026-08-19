@@ -1,0 +1,249 @@
+name: CodeMender CI/CD Guardrail
+
+# ---------------------------------------------------------------------------
+# Module 2 Lab — autonomous security scanning + remediation with Google
+# CodeMender (the `cm` CLI), wired as a CI/CD deployment guardrail.
+#
+# Flow (one push to main demonstrates all four grading criteria):
+#   checkout -> install cm -> cm init -> cm find (scan, UPLOADS source)
+#     -> cm report -f json (artifact) -> triage -> cm fix (auto-patch)
+#     -> open remediation PR -> SECURITY GATE (fail red on HIGH/CRITICAL)
+#
+# Auth (KEYLESS — Workload Identity Federation; see lab/README.md Step 2):
+#   * No service-account key exists anywhere in this design. The runner mints
+#     a GitHub OIDC token (`id-token: write` below) and the auth step
+#     exchanges it for short-lived credentials of the CI service account,
+#     via the pool/provider created by lab/setup-wif.sh. Three repo
+#     VARIABLES (plain config, not secrets) wire it up:
+#       GCP_WIF_PROVIDER  — projects/<n>/locations/global/workloadIdentityPools/…/providers/…
+#       GCP_SA_EMAIL      — the CI service account to impersonate
+#       GCP_QUOTA_PROJECT — project that absorbs Vertex AI quota/billing
+#     plus ONE repo SECRET:
+#       WIF_AUDIENCE      — class-shared audience string the provider requires
+#                           in the OIDC token (`aud` claim). Keeps strangers
+#                           who merely name a repo ace-module2-lab from riding
+#                           the fixed-name admission rule. From the lab page.
+#     The SA needs BOTH roles/aiplatform.user AND
+#     roles/serviceusage.serviceUsageConsumer — aiplatform.user does NOT
+#     include serviceusage.services.use, and without the second role ADC
+#     fails with "Grant the caller the roles/serviceusage.serviceUsageConsumer
+#     role". `cm` (v0.2.0) reads ADC + GOOGLE_CLOUD_PROJECT, both exported
+#     by the auth step. Proven against the real cm backend by
+#     .github/workflows/wif-auth-test.yml.
+#   * GITHUB_TOKEN    — built-in; used to open the remediation pull request.
+# ---------------------------------------------------------------------------
+
+on:
+  push:
+    branches: [ "main" ]
+    paths-ignore:          # doc-only changes shouldn't trigger a ~20-min scan
+      - '**.md'
+      - 'lab/**'
+      - '.gitignore'
+  workflow_dispatch:
+  # Note: no `pull_request:` trigger — it produced branch-less red runs on the
+  # bot-authored remediation PR and GitHub "action_required" approval prompts.
+  # The fix/PR steps keep `github.event_name != 'pull_request'` guards, so a
+  # pull_request trigger can be safely re-added here to gate PRs if desired.
+
+permissions:
+  contents: write          # create the remediation branch / commit the patch
+  pull-requests: write     # open the autonomous remediation PR
+  id-token: write          # mint the GitHub OIDC token WIF exchanges for GCP creds
+
+env:
+  # Scoped scan target. Kept well under cm's ~10 MB per-scan upload limit and
+  # contains the canonical CRITICAL finding (SQL injection in routes/login.ts).
+  SCAN_PATH: routes
+  # The `cm` binary ships vendored in the repo, so template copies work with
+  # zero extra setup (GitHub does NOT copy Releases on fork/template — a
+  # release-download step here broke every student copy).
+  CM_BUNDLED: lab/bin/cm-linux
+  # How many of the top-ranked HIGH/CRITICAL findings to auto-remediate in one
+  # run (all land in a single PR). Set to 1 for a minimal single-fix lab.
+  CM_FIX_LIMIT: "3"
+
+jobs:
+  codemender-security:
+    name: Scan, Identify, and Patch
+    runs-on: ubuntu-latest
+    timeout-minutes: 60          # multiple cm fix calls are server round-trips
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history so cm can evaluate code context
+
+      # Keyless-auth preflight: fail fast, with one actionable message, if any
+      # of the three WIF repo variables is missing — instead of a cryptic
+      # token-exchange error at the auth step.
+      - name: Check WIF configuration
+        run: |
+          set -uo pipefail
+          MISSING=""
+          [ -n "${{ vars.GCP_WIF_PROVIDER }}" ]  || MISSING="$MISSING GCP_WIF_PROVIDER"
+          [ -n "${{ vars.GCP_SA_EMAIL }}" ]      || MISSING="$MISSING GCP_SA_EMAIL"
+          [ -n "${{ vars.GCP_QUOTA_PROJECT }}" ] || MISSING="$MISSING GCP_QUOTA_PROJECT"
+          [ -n "${{ secrets.WIF_AUDIENCE }}" ]   || MISSING="$MISSING WIF_AUDIENCE(Secrets-tab)"
+          if [ -n "$MISSING" ]; then
+            echo "::error title=Missing WIF configuration::Not set:$MISSING. cm authenticates keylessly via Workload Identity Federation — add the three VARIABLES and the WIF_AUDIENCE SECRET per lab/README.md Step 2 (values come from your instructor / lab page)."
+            exit 1
+          fi
+          echo "WIF configuration present:"
+          echo "  provider: ${{ vars.GCP_WIF_PROVIDER }}"
+          echo "  SA:       ${{ vars.GCP_SA_EMAIL }}"
+          echo "  project:  ${{ vars.GCP_QUOTA_PROJECT }}"
+          echo "  audience: (secret set)"
+
+      # Exchanges the runner's OIDC token for short-lived SA credentials,
+      # writes the ADC credential file, and exports
+      # GOOGLE_APPLICATION_CREDENTIALS + GOOGLE_CLOUD_PROJECT for all later
+      # steps — exactly what `cm` reads. No key is involved at any point.
+      - name: Authenticate to Google Cloud (WIF / ADC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_EMAIL }}
+          project_id: ${{ vars.GCP_QUOTA_PROJECT }}
+          # Class-shared audience: the provider only accepts OIDC tokens
+          # minted with this `aud` value (second factor next to the repo name).
+          audience: ${{ secrets.WIF_AUDIENCE }}
+
+      - name: Install CodeMender CLI (cm)
+        run: |
+          set -euo pipefail
+          if [ ! -f "$CM_BUNDLED" ]; then
+            echo "::error title=cm binary missing::$CM_BUNDLED not found in this repo. Copy the template repo fully (it ships the binary) — see lab/INSTRUCTOR.md."
+            exit 1
+          fi
+          # Copy out of the checkout so later steps get a stable `cm` on PATH
+          # and the working tree stays clean for the remediation diff.
+          mkdir -p "$RUNNER_TEMP/cmbin"
+          install -m 0755 "$CM_BUNDLED" "$RUNNER_TEMP/cmbin/cm"
+          echo "$RUNNER_TEMP/cmbin" >> "$GITHUB_PATH"     # cm on PATH for later steps
+          "$RUNNER_TEMP/cmbin/cm" --version || true
+
+      - name: Initialize CodeMender Workspace (cm init)
+        run: |
+          set -uo pipefail
+          # Creates ~/.codemender/ (default config, state DB, patch storage).
+          cm init || true
+          # Non-fatal environment self-check — surfaces auth/config problems
+          # here instead of minutes into the scan.
+          cm init --verify || echo "::warning::cm init --verify reported problems (see log above)."
+          ls -la "$HOME/.codemender/" 2>/dev/null || echo "::warning::~/.codemender was not created by cm init."
+
+      - name: CodeMender Scan (cm find)
+        id: scan
+        run: |
+          set -uo pipefail
+          echo "Scanning '$SCAN_PATH' (in-scope source is uploaded to Google's CodeMender service)..."
+          cm find "$SCAN_PATH" -y 2>&1 | tee "$RUNNER_TEMP/cm-find.cm.log"
+
+      - name: Export Security Report (cm report -f json)
+        if: ${{ always() && steps.scan.conclusion != 'skipped' }}
+        run: |
+          set -uo pipefail
+          cm report -f json > "$RUNNER_TEMP/cm-security-report.json" 2> "$RUNNER_TEMP/cm-report.err" || true
+          echo "----- report (first 2 KB) -----"
+          head -c 2048 "$RUNNER_TEMP/cm-security-report.json" || true
+          echo
+
+      - name: Upload Security Report
+        if: ${{ always() && steps.scan.conclusion != 'skipped' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: codemender-report
+          path: ${{ runner.temp }}/cm-security-report.json
+          if-no-files-found: warn
+
+      - name: Triage Findings
+        id: triage
+        run: |
+          python3 .github/scripts/cm_triage.py "$RUNNER_TEMP/cm-security-report.json"
+
+      - name: Autonomous Remediation (cm fix, top-N)
+        id: fix
+        # Open a remediation PR on push or manual run; PR events only scan+gate.
+        if: ${{ github.event_name != 'pull_request' && steps.triage.outputs.fix_ids != '' }}
+        run: |
+          set -uo pipefail
+          echo "Remediating top finding(s): ${{ steps.triage.outputs.fix_ids }}"
+          for FID in ${{ steps.triage.outputs.fix_ids }}; do
+            echo "::group::cm fix $FID"
+            # --bypass-warning: cm 0.2.0's responsibility warning must be
+            # acknowledged interactively once per machine; CI runners are
+            # fresh every run, so the session dies before fixing without it.
+            cm fix "$FID" -y --bypass-warning 2>&1 | tee "$RUNNER_TEMP/fix-$FID.cm.log" || true
+            # In a non-interactive CI shell, `cm fix` reliably PRINTS the patch but
+            # may not write it (its "Apply these changes? [y/N]" prompt reads EOF).
+            # Extract the printed diff and apply it ONLY if it applies cleanly — so
+            # this is a no-op when cm already wrote the file itself.
+            python3 .github/scripts/extract_cm_diff.py "$RUNNER_TEMP/fix-$FID.cm.log" > "$RUNNER_TEMP/fix-$FID.patch" || true
+            if [ -s "$RUNNER_TEMP/fix-$FID.patch" ] \
+               && git apply --check -p1 --directory="$SCAN_PATH" "$RUNNER_TEMP/fix-$FID.patch" 2>/dev/null; then
+              git apply -p1 --directory="$SCAN_PATH" "$RUNNER_TEMP/fix-$FID.patch"
+              echo "Applied extracted patch for $FID."
+            else
+              echo "No clean diff to apply for $FID (cm applied it directly, or it conflicts) — skipping."
+            fi
+            echo "::endgroup::"
+          done
+          echo "----- working-tree changes under $SCAN_PATH -----"
+          git status --porcelain -- "$SCAN_PATH" || true
+
+      - name: Open Remediation Pull Request
+        id: pr
+        if: ${{ github.event_name != 'pull_request' && steps.fix.outcome == 'success' }}
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          base: main
+          branch: codemender/auto-remediation
+          delete-branch: true
+          add-paths: |
+            ${{ env.SCAN_PATH }}/**
+          commit-message: |
+            fix(security): CodeMender autonomous remediation
+
+            Patches generated by `cm fix` for the top ${{ steps.triage.outputs.fix_count }} HIGH/CRITICAL finding(s).
+          title: "🤖 CodeMender: autonomous security remediation (${{ steps.triage.outputs.fix_count }} fix(es))"
+          labels: |
+            security
+            automated
+            codemender
+          body: |
+            ## 🤖 Autonomous remediation by CodeMender
+
+            CodeMender's CI/CD guardrail scanned `${{ env.SCAN_PATH }}` and found
+            **${{ steps.triage.outputs.high_critical }} HIGH/CRITICAL** finding(s).
+            This PR auto-remediates the top **${{ steps.triage.outputs.fix_count }}** via `cm fix`:
+
+            ${{ steps.triage.outputs.fix_summary }}
+
+            ---
+            Full machine-readable report: the **`codemender-report`** artifact on
+            [run #${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+
+            > ⚠️ Review before merging. The pipeline run on `main` stays **red** until
+            > the HIGH/CRITICAL findings are resolved — that is the deployment gate.
+
+      - name: Security Gate (fail on HIGH/CRITICAL)
+        if: always()          # the deploy decision must run even if the PR step had issues
+        run: |
+          set -uo pipefail
+          # Fail CLOSED: no completed scan/triage means no evidence the code is
+          # safe — that blocks deployment too. (A gate that passes green when
+          # the scanner crashed would wave unscanned code through.)
+          if [ "${{ steps.triage.outcome }}" != "success" ]; then
+            echo "::error title=Deployment blocked::Security scan did not complete (triage outcome: ${{ steps.triage.outcome }}). Failing closed — no scan, no deploy."
+            exit 1
+          fi
+          COUNT="${{ steps.triage.outputs.high_critical }}"
+          COUNT="${COUNT:-0}"
+          if [ "$COUNT" -gt 0 ]; then
+            echo "::error title=Deployment blocked::CodeMender found $COUNT HIGH/CRITICAL finding(s). Failing the pipeline."
+            exit 1
+          fi
+          echo "No HIGH/CRITICAL findings — security gate passed. ✅"

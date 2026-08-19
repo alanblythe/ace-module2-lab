@@ -1,0 +1,90 @@
+# Proves keyless (WIF) auth works end-to-end with CodeMender BEFORE we switch
+# the lab pipeline to it. Manual trigger only; does not touch the lab flow.
+#
+# Prereqs (see lab/setup-wif.sh):
+#   repo variables GCP_WIF_PROVIDER, GCP_SA_EMAIL, GCP_QUOTA_PROJECT
+#
+# Pass = the "CodeMender via WIF" step completes a 1-file scan: that exercises
+# token exchange -> SA impersonation -> ADC -> Vertex AI quota attribution,
+# i.e. every auth property the real pipeline needs.
+name: WIF Auth Test (CodeMender)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write        # lets the runner mint the GitHub OIDC token WIF exchanges
+
+env:
+  CM_BUNDLED: lab/bin/cm-linux   # vendored in the repo (releases don't copy on fork/template)
+
+jobs:
+  wif-test:
+    name: Keyless auth + CodeMender smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Guard - WIF variables present
+        run: |
+          set -euo pipefail
+          MISSING=""
+          [ -n "${{ vars.GCP_WIF_PROVIDER }}" ] || MISSING="$MISSING GCP_WIF_PROVIDER"
+          [ -n "${{ vars.GCP_SA_EMAIL }}" ]     || MISSING="$MISSING GCP_SA_EMAIL"
+          [ -n "${{ vars.GCP_QUOTA_PROJECT }}" ] || MISSING="$MISSING GCP_QUOTA_PROJECT"
+          [ -n "${{ secrets.WIF_AUDIENCE }}" ]   || MISSING="$MISSING WIF_AUDIENCE(secret)"
+          if [ -n "$MISSING" ]; then
+            echo "::error title=WIF configuration missing::Set:$MISSING (lab/setup-wif.sh prints the exact commands; audience comes from the lab page)."
+            exit 1
+          fi
+
+      - name: Authenticate to Google Cloud (WIF - no key anywhere)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_SA_EMAIL }}
+          audience: ${{ secrets.WIF_AUDIENCE }}
+
+      - name: Prove identity
+        run: |
+          set -euo pipefail
+          echo "ADC file type (expect external_account):"
+          python3 -c 'import json,os; print(json.load(open(os.environ["GOOGLE_APPLICATION_CREDENTIALS"]))["type"])'
+          TOKEN=$(gcloud auth print-access-token)
+          echo "GCP sees this token as:"
+          curl -sf "https://www.googleapis.com/oauth2/v3/tokeninfo?access_token=$TOKEN" \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); print(" ", d.get("email"), "| scopes:", d.get("scope","")[:80])'
+
+      - name: Install CodeMender CLI (cm)
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/cmbin"
+          install -m 0755 "$CM_BUNDLED" "$RUNNER_TEMP/cmbin/cm"
+          echo "$RUNNER_TEMP/cmbin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/cmbin/cm" --version || true
+
+      - name: CodeMender via WIF (init + 1-file scan)
+        env:
+          GOOGLE_CLOUD_PROJECT: ${{ vars.GCP_QUOTA_PROJECT }}
+        run: |
+          set -euo pipefail
+          cm init || true
+          # Tiny scan scope = fast test that still round-trips the real
+          # backend: upload, server-side scan session, report download.
+          SCAN_DIR="$RUNNER_TEMP/wif-smoke"
+          mkdir -p "$SCAN_DIR"
+          cp routes/login.ts "$SCAN_DIR/"
+          cm find "$SCAN_DIR" -y
+          cm report -f json > "$RUNNER_TEMP/wif-smoke-report.json"
+          python3 - "$RUNNER_TEMP/wif-smoke-report.json" <<'EOF'
+          import json, sys
+          findings = json.load(open(sys.argv[1]))
+          findings = findings if isinstance(findings, list) else findings.get("Findings", [])
+          print(f"WIF smoke scan complete: {len(findings)} finding(s)")
+          for f in findings:
+              print(f"  - [{f.get('Severity')}] {f.get('Title')}")
+          EOF
+          echo "✅ CodeMender authenticated and scanned via WIF — no key involved."
